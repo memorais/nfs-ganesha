@@ -1097,6 +1097,135 @@ static fsal_status_t file_unlink(struct fsal_obj_handle *dir_hdl,
 	return status;
 }
 
+/*
+ * @brief: Copy glusterfs_fd structure
+ *
+ * Note: If is_dup is set to true, a new glusterfs_fd is created
+ * with extra ref and hence need to be closed separately.
+ * Whereas if false, both src_fd and dst_fd contain single reference
+ * to glfd. Hence closing one of the them shall destroy other fd too.
+ */
+fsal_status_t glusterfs_copy_my_fd(struct glusterfs_fd *src_fd,
+				 struct glusterfs_fd *dst_fd,
+				 bool is_dup)
+{
+	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
+
+	if (!src_fd || !dst_fd) {
+		return fsalstat(ERR_FSAL_INVAL, 0);
+	}
+
+	if (is_dup) {
+		dst_fd->glfd = glfs_dup(src_fd->glfd);
+		if (src_fd->creds.caller_glen)
+			dst_fd->creds.caller_garray =
+				gsh_memdup(src_fd->creds.caller_garray,
+					   src_fd->creds.caller_glen *
+					   sizeof(gid_t));
+	} else {
+		dst_fd->glfd = src_fd->glfd;
+		dst_fd->creds.caller_garray = src_fd->creds.caller_garray;
+	}
+
+	dst_fd->openflags = src_fd->openflags;
+	dst_fd->creds.caller_uid = src_fd->creds.caller_uid;
+	dst_fd->creds.caller_gid = src_fd->creds.caller_gid;
+	dst_fd->creds.caller_glen = src_fd->creds.caller_glen;
+#ifdef USE_GLUSTER_DELEGATION
+	memcpy(dst_fd->lease_id, src_fd->lease_id, GLAPI_LEASE_ID_SIZE);
+#endif
+	return status;
+}
+
+struct glfs_object*
+glusterfs_create_my_fd(struct glusterfs_handle *parenthandle, const char *name,
+		   fsal_openflags_t openflags, int posix_flags,
+		   mode_t unix_mode, struct stat *sb,
+		   struct glusterfs_fd *my_fd)
+{
+	struct glusterfs_export *glfs_export =
+	    container_of(op_ctx->fsal_export, struct glusterfs_export, export);
+	gid_t **garray_copy = NULL;
+	int p_flags = 0;
+	struct glfs_object *glhandle = NULL;
+#ifdef GLTIMING
+	struct timespec s_time, e_time;
+
+	now(&s_time);
+#endif
+
+	if (!parenthandle || !name || !sb || !my_fd) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	LogFullDebug(COMPONENT_FSAL,
+		     "my_fd->fd = %p openflags = %x, posix_flags = %x",
+		     my_fd->glfd, openflags, posix_flags);
+
+	assert(my_fd->glfd == NULL
+	       && my_fd->openflags == FSAL_O_CLOSED && openflags != 0);
+
+	LogFullDebug(COMPONENT_FSAL,
+		     "openflags = %x, posix_flags = %x",
+		     openflags, posix_flags);
+
+	SET_GLUSTER_CREDS(glfs_export, &op_ctx->creds->caller_uid,
+			  &op_ctx->creds->caller_gid,
+			  op_ctx->creds->caller_glen,
+			  op_ctx->creds->caller_garray,
+			  op_ctx->client->addr.addr,
+			  op_ctx->client->addr.len);
+
+	glhandle = glfs_h_creat_open(glfs_export->gl_fs->fs,
+				 parenthandle->glhandle,
+				 name, p_flags, unix_mode, sb,
+				 &my_fd->glfd);
+
+	/* restore credentials */
+	SET_GLUSTER_CREDS(glfs_export, NULL, NULL, 0, NULL, NULL, 0);
+
+	if (!glhandle || my_fd->glfd == NULL) {
+		goto out;
+	}
+
+	my_fd->openflags = FSAL_O_NFS_FLAGS(openflags);
+	my_fd->creds.caller_uid = op_ctx->creds->caller_uid;
+	my_fd->creds.caller_gid = op_ctx->creds->caller_gid;
+	my_fd->creds.caller_glen = op_ctx->creds->caller_glen;
+	garray_copy = &my_fd->creds.caller_garray;
+
+	if ((*garray_copy) != NULL) {
+		/* Replace old creds */
+		gsh_free(*garray_copy);
+		*garray_copy = NULL;
+	}
+
+	if (op_ctx->creds->caller_glen) {
+		(*garray_copy) = gsh_malloc(op_ctx->creds->caller_glen
+					    * sizeof(gid_t));
+		memcpy((*garray_copy), op_ctx->creds->caller_garray,
+			op_ctx->creds->caller_glen * sizeof(gid_t));
+	}
+
+#ifdef USE_GLUSTER_DELEGATION
+	if ((op_ctx->client->addr.addr)
+						<= GLAPI_LEASE_ID_SIZE) {
+		memcpy(my_fd->lease_id,
+		       op_ctx->client->addr.addr,
+		       op_ctx->client->addr.len);
+	} else
+		memset(my_fd->lease_id, 0, GLAPI_LEASE_ID_SIZE);
+#endif
+
+out:
+#ifdef GLTIMING
+	now(&e_time);
+	latency_update(&s_time, &e_time, lat_file_open);
+#endif
+	return glhandle;
+}
+
 /**
  * @brief Implements GLUSTER FSAL objectoperation share_op
  */
@@ -1462,6 +1591,7 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 	    container_of(op_ctx->fsal_export, struct glusterfs_export, export);
 	struct glusterfs_handle *myself, *parenthandle = NULL;
 	struct glusterfs_fd *my_fd = NULL;
+	struct glusterfs_fd tmp_fd = {};
 	struct stat sb = {0};
 	struct glfs_object *glhandle = NULL;
 	unsigned char globjhdl[GFAPI_HANDLE_LENGTH] = {'\0'};
@@ -1540,8 +1670,8 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 			/* We need to use the global fd to continue, and take
 			 * the lock to protect it.
 			 */
-			my_fd = &myself->globalfd;
 			PTHREAD_RWLOCK_wrlock(&obj_hdl->obj_lock);
+			my_fd = &myself->globalfd;
 		}
 
 		if (my_fd->openflags != FSAL_O_CLOSED) {
@@ -1734,8 +1864,28 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 		 * the caller to perform a permission check.
 		 */
 		*caller_perm_check = true;
-		goto open;
+
+		/* We need to use the global fd to continue, and take
+		 * the lock to protect it.
+		 */
+		PTHREAD_RWLOCK_wrlock(&obj_hdl->obj_lock);
+		if (my_fd == NULL) /* case: state == NULL */
+			my_fd = &myself->globalfd;
+
+		/* De we need to check share reservation conflicts? */
+		status = glusterfs_open_my_fd(myself, openflags,
+					 p_flags, my_fd);
+		PTHREAD_RWLOCK_unlock(&obj_hdl->obj_lock);
+
+		if (FSAL_IS_ERROR(status))
+			goto direrr;
+		else
+			goto open;
+
 	}
+
+	if (!my_fd) /* case: state == NULL */
+		my_fd = &tmp_fd;
 
 	/* Become the user because we are creating an object in this dir.
 	 */
@@ -1750,9 +1900,8 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 	/** @todo: glfs_h_creat doesn't honour NO_CREATE mode. Instead use
 	 *  glfs_h_open to verify if the file already exists.
 	 */
-	glhandle =
-	    glfs_h_creat(glfs_export->gl_fs->fs, parenthandle->glhandle, name,
-			 p_flags, unix_mode, &sb);
+	glhandle = glusterfs_create_my_fd(parenthandle, name, openflags,
+					p_flags, unix_mode, &sb, my_fd);
 
 	if (glhandle == NULL && errno == EEXIST &&
 		 createmode == FSAL_UNCHECKED) {
@@ -1767,9 +1916,9 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 		 * the condition of not wanting to set attributes.
 		 */
 		p_flags &= ~O_EXCL;
-		glhandle =
-		    glfs_h_creat(glfs_export->gl_fs->fs, parenthandle->glhandle,
-				 name, p_flags, unix_mode, &sb);
+		glhandle = glusterfs_create_my_fd(parenthandle, name, openflags,
+					p_flags, unix_mode, &sb, my_fd);
+
 	} else if (!errno) {
 		created = true;
 	}
@@ -1777,7 +1926,7 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 	/* restore credentials */
 	SET_GLUSTER_CREDS(glfs_export, NULL, NULL, 0, NULL, NULL, 0);
 
-	if (glhandle == NULL) {
+	 if (glhandle == NULL || my_fd->glfd == NULL) {		
 		status = gluster2fsal_error(errno);
 		goto out;
 	}
@@ -1846,15 +1995,20 @@ static fsal_status_t glusterfs_open2(struct fsal_obj_handle *obj_hdl,
 	 * handy since we can then call setattr2 which WILL take the lock
 	 * without a double locking deadlock.
 	 */
-	if (my_fd == NULL)
-		my_fd = &myself->globalfd;
 
-open:
-	/* now open it */
-	status = glusterfs_open_my_fd(myself, openflags, p_flags, my_fd);
+	status = glusterfs_copy_my_fd(my_fd, &myself->globalfd,
+					(state != NULL));
 
 	if (FSAL_IS_ERROR(status))
-		goto direrr;
+		goto fileerr;
+
+	/* Since we copied it to globalfd, increment
+	 * open_fd_count
+	 */
+	if (state != NULL)
+		(void) atomic_inc_size_t(&open_fd_count);
+
+open:
 
 	if (created && attrib_set->valid_mask != 0) {
 		/* Set attributes using our newly opened file descriptor as the
@@ -2010,6 +2164,14 @@ static fsal_status_t glusterfs_reopen2(struct fsal_obj_handle *obj_hdl,
 	update_share_counters(&myself->share, old_openflags, openflags);
 
 	PTHREAD_RWLOCK_unlock(&obj_hdl->obj_lock);
+
+	/* No need to reopen the file if the openflags are same.
+	 * XXX: Compare creds too post using glfs_h_create_open
+	 * atomic fop to create and open in open2 */
+	if (!(openflags & ~(FSAL_O_OPENFLAGS)) &&
+		(old_openflags == openflags)) {
+		return fsalstat(ERR_FSAL_NO_ERROR, 0);
+	}
 
 	status = glusterfs_open_my_fd(myself, openflags, posix_flags, my_fd);
 
